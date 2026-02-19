@@ -19,8 +19,8 @@ import numpy as np
 
 '''
 IMPORTANT CAVEAT: 
-This model's baseline assumption of 100% prodrug cleavage (C[0] = 100) relies heavily on the Phase 1b FSCD trial design, which requires paired ileal biopsies.
-Because scoping tight strictures is logistically difficult with intact anatomy, we assume the enrolled cohort will heavily skew toward Post-Ileocecal Resection (ICR) patients.
+This model's base case assumption of 100% prodrug cleavage (C[0] = 100) relies heavily on the Phase 1b FSCD trial design, which requires paired ileal biopsies.
+Because scoping tight strictures is logistically difficult with intact anatomy, we assume the enrolled cohort will heavily skew toward mild FSCD Post-Ileocecal Resection (ICR) patients.
 In post-ICR patients, the missing ileocecal valve allows colonic bacteria to reflux into the ileum, perfectly cleaving the pro-drug (100% activation).
 In a broader real-world population with an intact valve, the lack of colonic bacteria will likely lead to drastically lower active drug levels at the stricture lumen.
 
@@ -46,11 +46,15 @@ Structural floor: 1.2x due to less angiogenesis.
 '''
 
 class ReactionDiffusionScaledModel:
-    def __init__(self, wall_thickness_mm=8.0, dx_mm=0.02, total_days=14):
+    def __init__(self, wall_thickness_mm=8.0, dx_mm=0.02, total_days=14, lumen_radius_mm=5.0):
         self.L = wall_thickness_mm
         self.dx = dx_mm
         self.nx = int(self.L / self.dx) + 1
-        self.x_grid = np.linspace(0, self.L, self.nx)
+        
+        # Define the grid in terms of absolute radius from the center of the bowel
+        self.r_lumen = lumen_radius_mm
+        self.r_grid = np.linspace(self.r_lumen, self.r_lumen + self.L, self.nx)
+        
         self.total_days = total_days
         self.dt_seconds = 10.0
         
@@ -93,7 +97,7 @@ class ReactionDiffusionScaledModel:
         Runs the simulation with specific patient parameters.
         initial_hyperemia: Starting inflammation (e.g., 3.0 for flare).
         structural_floor: The best-case vascularity for this patient (1.5 for scar, 1.2 for de novo).
-        activation_pct: % of drug activated (100 = Colon-like/SIBO, 20 = Sterile Ileum).
+        activation_pct: % of drug activated (100 = Colon-like, 60 = SIBO, 20 = Sterile Ileum).
         dynamic_healing: If True, inflammation drops from initial to floor over time.
         """
         C = np.zeros(self.nx)
@@ -114,8 +118,8 @@ class ReactionDiffusionScaledModel:
             D_map = np.zeros(self.nx)
             k_map = np.zeros(self.nx)
             
-            for i, x in enumerate(self.x_grid):
-                d_f, k_f = self.get_layer_properties(x, m_end, t_end)
+            for i, r in enumerate(self.r_grid):
+                d_f, k_f = self.get_layer_properties(r - self.r_lumen, m_end, t_end)
                 D_map[i] = self.D_aq * d_f
                 k_map[i] = self.k_base * k_f * current_multiplier
 
@@ -140,11 +144,27 @@ class ReactionDiffusionScaledModel:
                 else: 
                     C[0] = c_input_max * np.exp(-0.346 * (day_fraction - 8.0))
 
+                # --- OLD CARTESIAN CODE ---
+                # d2C = (C[2:] - 2*C[1:-1] + C[:-2])
+                # C[1:-1] = C[1:-1] + (alpha[1:-1] * d2C) - (beta[1:-1] * C[1:-1])
+
+                # --- NEW CYLINDRICAL CODE ---
+                # Calculate 2nd derivative (diffusion across gradient)
                 d2C = (C[2:] - 2*C[1:-1] + C[:-2])
-                C[1:-1] = C[1:-1] + (alpha[1:-1] * d2C) - (beta[1:-1] * C[1:-1])
+
+                # Calculate 1st derivative (the geometric expansion penalty)
+                dC = (C[2:] - C[:-2]) / 2.0 
+
+                # The local radius for each point in the inner grid
+                r_local = self.r_grid[1:-1] 
+
+                # Apply the radial update
+                radial_penalty = (self.dx / r_local) * dC
+                C[1:-1] = C[1:-1] + alpha[1:-1] * (d2C + radial_penalty) - (beta[1:-1] * C[1:-1])
+                
                 C[-1] = C[-2] 
 
-        return C, self.x_grid, m_end, t_end
+        return C, self.r_grid, m_end, t_end
 
 def get_verdict(coverage_pct):
     if coverage_pct > 80:
@@ -189,8 +209,15 @@ def analyze_and_report(thickness, structural_floor=1.5, activation_pct=100.0, de
     )
     
     # Calculate Coverage
-    target_indices = np.where((x >= m_end) & (x <= t_end))[0]
+    # Subtract the lumen radius from the grid to get the relative wall depth
+    wall_depth = x - sim.r_lumen 
+    target_indices = np.where((wall_depth >= m_end) & (wall_depth <= t_end))[0]
     
+    # Add a safety check to prevent future divide-by-zero errors
+    if len(target_indices) == 0:
+        print("Error: No target indices found. Check grid boundaries.")
+        return
+
     cov_cold = (np.sum(conc_cold[target_indices] > IC90) / len(target_indices)) * 100
     cov_dyn = (np.sum(conc_dyn[target_indices] > IC90) / len(target_indices)) * 100
     
@@ -208,7 +235,7 @@ def analyze_and_report(thickness, structural_floor=1.5, activation_pct=100.0, de
 
 if __name__ == "__main__":
     # Mild FSCD, Anastomotic Scar -> High Floor, prior ileocecal resection
-    analyze_and_report(thickness=5.0, structural_floor=1.5, activation_pct=100.0, description="Post-Ileocecal Resection with Dense Scarring")
+    analyze_and_report(thickness=5.0, structural_floor=1.5, activation_pct=100.0, description="(Base Case) Post-Ileocecal Resection with Dense Scarring")
 
     # Moderate FSCD, Anastomotic Scar -> High Floor, prior ileocecal resection
     analyze_and_report(thickness=7.0, structural_floor=1.5, activation_pct=100.0, description="Post-Ileocecal Resection with Dense Scarring")
@@ -239,16 +266,16 @@ The "Target Zone" is the Fibrotic Submucosa. This is the engine room where the s
 ==========================================
 REPORT FOR 5.0mm WALL STRICTURE
 Patient Profile: Floor=1.5x | Activation=100.0%
-Patient Description: Post-Ileocecal Resection with Dense Scarring
+Patient Description: (Base Case) Post-Ileocecal Resection with Dense Scarring
 ==========================================
 THEORETICAL BEST CASE (Structural Baseline)
  - Max potential if acute inflammation is fully resolved.
- - Target Coverage: 96.7%
+ - Target Coverage: 90.0%
  - Verdict:  VERY BULLISH (Interception Likely)
 ----------------------------------------
 PREDICTED TRIAL RESULT (Day 14 Dynamic)
  - Starts with flare (3.0x), heals to baseline (1.5x).
- - Target Coverage: 86.9%
+ - Target Coverage: 81.7%
  - Verdict:  VERY BULLISH (Interception Likely)
 
 ==========================================
@@ -258,12 +285,12 @@ Patient Description: Post-Ileocecal Resection with Dense Scarring
 ==========================================
 THEORETICAL BEST CASE (Structural Baseline)
  - Max potential if acute inflammation is fully resolved.
- - Target Coverage: 58.4%
+ - Target Coverage: 54.5%
  - Verdict:  NEUTRAL (Slowing Progression)
 ----------------------------------------
 PREDICTED TRIAL RESULT (Day 14 Dynamic)
  - Starts with flare (3.0x), heals to baseline (1.5x).
- - Target Coverage: 53.5%
+ - Target Coverage: 49.5%
  - Verdict:  NEUTRAL (Slowing Progression)
 
 ==========================================
@@ -273,12 +300,12 @@ Patient Description: Post-Ileocecal Resection with Dense Scarring
 ==========================================
 THEORETICAL BEST CASE (Structural Baseline)
  - Max potential if acute inflammation is fully resolved.
- - Target Coverage: 41.8%
+ - Target Coverage: 38.6%
  - Verdict:  NEUTRAL (Slowing Progression)
 ----------------------------------------
 PREDICTED TRIAL RESULT (Day 14 Dynamic)
  - Starts with flare (3.0x), heals to baseline (1.5x).
- - Target Coverage: 38.3%
+ - Target Coverage: 35.0%
  - Verdict:  NEUTRAL (Slowing Progression)
 
 ==========================================
@@ -288,12 +315,12 @@ Patient Description: De Novo Stricture with Localized SIBO
 ==========================================
 THEORETICAL BEST CASE (Structural Baseline)
  - Max potential if acute inflammation is fully resolved.
- - Target Coverage: 90.2%
+ - Target Coverage: 81.7%
  - Verdict:  VERY BULLISH (Interception Likely)
 ----------------------------------------
 PREDICTED TRIAL RESULT (Day 14 Dynamic)
  - Starts with flare (3.0x), heals to baseline (1.2x).
- - Target Coverage: 77.0%
+ - Target Coverage: 71.7%
  - Verdict:  BULLISH (Effective Treatment)
 
 ==========================================
@@ -303,12 +330,12 @@ Patient Description: De Novo Stricture with Localized SIBO
 ==========================================
 THEORETICAL BEST CASE (Structural Baseline)
  - Max potential if acute inflammation is fully resolved.
- - Target Coverage: 54.5%
+ - Target Coverage: 50.5%
  - Verdict:  NEUTRAL (Slowing Progression)
 ----------------------------------------
 PREDICTED TRIAL RESULT (Day 14 Dynamic)
  - Starts with flare (3.0x), heals to baseline (1.2x).
- - Target Coverage: 46.5%
+ - Target Coverage: 43.4%
  - Verdict:  NEUTRAL (Slowing Progression)
 
 ==========================================
