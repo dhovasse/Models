@@ -11,9 +11,10 @@ import numpy as np
 # - Scaled Anatomy: Layers expand as the wall gets thicker.
 # - Hyperemia: Simulates the effect of inflammation washing the drug away.
 # - Dynamic Healing: Models the reduction in inflammation over time as the drug takes effect.
+# - ACAT Area-Proportional Transit Calculation: Transit time scales with the loss of cross-sectional area due to stricture.
 #
 # Credit: This model was inspired by the detailed analysis from a blog post authored by Chaotropy, which provided critical insights into the expected drug behavior in FSCD and helped shape the assumptions and parameters used in this simulation.
-# Source: https://chaotropy.com/pali-2108-fscd-prediction-model/
+# Source: https://www.chaotropy.com/computational-modeling-of-palisade-bios-pali-2108-tissue-penetration-in-fibrostenotic-crohns-disease/
 #
 # Note: This model is a simplified representation and should be interpreted in the context of its assumptions and limitations. It is intended for educational purposes to understand the potential drug penetration dynamics in FSCD.
 
@@ -85,30 +86,18 @@ class ReactionDiffusionScaledModel:
             return initial_multiplier
         
         # Virtuous Cycle Logic:
-        # Acute inflammation (swelling) is the part above the structural floor.
-        # This decays over time, but can't go lower than the patient's structural vascularity.
         acute_component = max(0, initial_multiplier - floor)
         decayed_acute = acute_component * np.exp(-0.2 * day) # Rapid drop in first week
         
         return floor + decayed_acute
 
-    def run_simulation(self, initial_hyperemia=1.0, structural_floor=1.5, activation_pct=100.0, dynamic_healing=False):
-        """
-        Runs the simulation with specific patient parameters.
-        initial_hyperemia: Starting inflammation (e.g., 3.0 for flare).
-        structural_floor: The best-case vascularity for this patient (1.5 for scar, 1.2 for de novo).
-        activation_pct: % of drug activated (100 = Colon-like, 60 = SIBO, 20 = Sterile Ileum).
-        dynamic_healing: If True, inflammation drops from initial to floor over time.
-        """
+    def run_simulation(self, initial_hyperemia=1.0, structural_floor=1.5, activation_pct=100.0, dynamic_healing=False, transit_hours=8.0):
         C = np.zeros(self.nx)
         steps_per_day = int((24 * 3600) / self.dt_seconds)
         
         m_end, t_end = self.get_layer_boundaries()
-        
-        # Calculate C_input based on activation percentage
         c_input_max = 100.0 * (activation_pct / 100.0)
 
-        # Loop Day by Day
         for day in range(1, self.total_days + 1):
             
             # 1. Calculate today's inflammation level
@@ -139,26 +128,16 @@ class ReactionDiffusionScaledModel:
                 day_fraction = (s * self.dt_seconds / 3600.0) % 24
                 
                 # Dosing
-                if day_fraction <= 8.0: 
+                if day_fraction <= transit_hours: 
                     C[0] = c_input_max
                 else: 
-                    C[0] = c_input_max * np.exp(-0.346 * (day_fraction - 8.0))
-
-                # --- OLD CARTESIAN CODE ---
-                # d2C = (C[2:] - 2*C[1:-1] + C[:-2])
-                # C[1:-1] = C[1:-1] + (alpha[1:-1] * d2C) - (beta[1:-1] * C[1:-1])
+                    C[0] = c_input_max * np.exp(-0.346 * (day_fraction - transit_hours))
 
                 # --- NEW CYLINDRICAL CODE ---
-                # Calculate 2nd derivative (diffusion across gradient)
                 d2C = (C[2:] - 2*C[1:-1] + C[:-2])
-
-                # Calculate 1st derivative (the geometric expansion penalty)
                 dC = (C[2:] - C[:-2]) / 2.0 
-
-                # The local radius for each point in the inner grid
                 r_local = self.r_grid[1:-1] 
 
-                # Apply the radial update
                 radial_penalty = (self.dx / r_local) * dC
                 C[1:-1] = C[1:-1] + alpha[1:-1] * (d2C + radial_penalty) - (beta[1:-1] * C[1:-1])
                 
@@ -176,44 +155,70 @@ def get_verdict(coverage_pct):
     else:
         return "BEARISH (Ineffective for Deep Disease)"
 
-def analyze_and_report(thickness, structural_floor=1.5, activation_pct=100.0, description=""):
-    """
-    Analyzes a specific patient profile defined by structural_floor and activation_pct.
-    """
-    sim = ReactionDiffusionScaledModel(wall_thickness_mm=thickness)
+def analyze_and_report(thickness, structural_floor=1.5, activation_pct=100.0, missing_valve=True, description=""):
+    # 1. Calculate Anatomy (Conservation of Mass Geometry)
+    outer_bowel_radius_mm = 12.0
+    healthy_wall_mm = 2.0
+    healthy_lumen_mm = outer_bowel_radius_mm - healthy_wall_mm # Baseline 10.0mm radius
+    
+    # Calculate the narrowed lumen based on the diseased wall thickness
+    dynamic_lumen_mm = max(0.5, outer_bowel_radius_mm - thickness) 
+    
+    sim = ReactionDiffusionScaledModel(wall_thickness_mm=thickness, lumen_radius_mm=dynamic_lumen_mm)
     IC90 = 1.0
+
+    # 2. Establish the Baseline Biological Transit
+    if missing_valve:
+        base_transit = 5.0  # Missing valve baseline
+    else:
+        base_transit = 8.0  # Intact valve baseline
+        
+    # 3. ACAT Area-Proportional Transit Calculation
+    # Delay scales proportionally with the loss of cross-sectional area (r^2)
+    area_ratio = (healthy_lumen_mm / dynamic_lumen_mm)**2
+    calculated_transit = base_transit * area_ratio
+    
+    # 4. Apply the Clinical Obstruction Guardrail
+    # Small bowel stasis beyond 16 hours typically results in acute clinical obstruction (vomiting, NPO).
+    # We cap the model here, as a patient beyond this would not be taking daily oral medication.
+    transit_hours = min(16.0, calculated_transit)
     
     print(f"\n==========================================")
     print(f"REPORT FOR {thickness}mm WALL STRICTURE")
-    print(f"Patient Profile: Floor={structural_floor}x | Activation={activation_pct}%")
+    print(f"Lumen narrowed to: {dynamic_lumen_mm:.1f}mm (Area Ratio: {area_ratio:.2f}x)")
+    
+    if calculated_transit > 16.0:
+        print(f"Calculated Transit: {calculated_transit:.1f} hours -> CAPPED at {transit_hours:.1f}h (Clinical Obstruction Limit)")
+    else:
+        print(f"Calculated Transit Time: {transit_hours:.1f} hours")
+        
+    print(f"Patient Profile: Floor={structural_floor}x | Activation={activation_pct}% | Missing Ileocecal Valve: {'Yes' if missing_valve else 'No'}")
     if description:
         print(f"Patient Description: {description}")
     print(f"==========================================")
     
-    # THEORETICAL BEST CASE: Structural Baseline
-    # Assumes no acute inflammation, just the structural reality (floor).
+    # THEORETICAL BEST CASE
     conc_cold, x, m_end, t_end = sim.run_simulation(
         initial_hyperemia=structural_floor, 
         structural_floor=structural_floor,
         activation_pct=activation_pct,
+        transit_hours=transit_hours,
         dynamic_healing=False
     )
     
-    # PREDICTED TRIAL RESULT: Active Inflammation (Dynamic)
-    # Starts at 3.0x (Flare) and heals down to the structural_floor.
+    # PREDICTED TRIAL RESULT
     conc_dyn, _, _, _ = sim.run_simulation(
         initial_hyperemia=3.0, 
         structural_floor=structural_floor,
         activation_pct=activation_pct,
+        transit_hours=transit_hours,
         dynamic_healing=True
     )
     
     # Calculate Coverage
-    # Subtract the lumen radius from the grid to get the relative wall depth
     wall_depth = x - sim.r_lumen 
     target_indices = np.where((wall_depth >= m_end) & (wall_depth <= t_end))[0]
     
-    # Add a safety check to prevent future divide-by-zero errors
     if len(target_indices) == 0:
         print("Error: No target indices found. Check grid boundaries.")
         return
@@ -222,35 +227,31 @@ def analyze_and_report(thickness, structural_floor=1.5, activation_pct=100.0, de
     cov_dyn = (np.sum(conc_dyn[target_indices] > IC90) / len(target_indices)) * 100
     
     print(f"THEORETICAL BEST CASE (Structural Baseline)")
-    print(f" - Max potential if acute inflammation is fully resolved.")
     print(f" - Target Coverage: {cov_cold:.1f}%")
     print(f" - Verdict:  {get_verdict(cov_cold)}")
-    
     print(f"-" * 40)
-    
     print(f"PREDICTED TRIAL RESULT (Day {sim.total_days} Dynamic)")
-    print(f" - Starts with flare (3.0x), heals to baseline ({structural_floor}x).")
     print(f" - Target Coverage: {cov_dyn:.1f}%")
     print(f" - Verdict:  {get_verdict(cov_dyn)}")
 
 if __name__ == "__main__":
     # Mild FSCD, Anastomotic Scar -> High Floor, prior ileocecal resection
-    analyze_and_report(thickness=5.0, structural_floor=1.5, activation_pct=100.0, description="(Base Case) Post-Ileocecal Resection with Dense Scarring")
+    analyze_and_report(thickness=5.0, structural_floor=1.5, activation_pct=100.0, missing_valve=True, description="(Base Case) Post-Ileocecal Resection with Dense Scarring")
 
     # Moderate FSCD, Anastomotic Scar -> High Floor, prior ileocecal resection
-    analyze_and_report(thickness=7.0, structural_floor=1.5, activation_pct=100.0, description="Post-Ileocecal Resection with Dense Scarring")
+    analyze_and_report(thickness=7.0, structural_floor=1.5, activation_pct=100.0, missing_valve=True, description="Post-Ileocecal Resection with Dense Scarring")
 
     # Severe FSCD, Anastomotic Scar -> High Floor, prior ileocecal resection
-    analyze_and_report(thickness=9.0, structural_floor=1.5, activation_pct=100.0, description="Post-Ileocecal Resection with Dense Scarring")
+    analyze_and_report(thickness=9.0, structural_floor=1.5, activation_pct=100.0, missing_valve=True, description="Post-Ileocecal Resection with Dense Scarring")
 
     # Mild FSCD, De Novo + SIBO -> Low Floor, High SIBO
-    analyze_and_report(thickness=5.0, structural_floor=1.2, activation_pct=60.0, description="De Novo Stricture with Localized SIBO")
+    analyze_and_report(thickness=5.0, structural_floor=1.2, activation_pct=60.0, missing_valve=False, description="De Novo Stricture with Localized SIBO")
 
     # Moderate FSCD, De Novo + SIBO -> Low Floor, High SIBO
-    analyze_and_report(thickness=7.0, structural_floor=1.2, activation_pct=60.0, description="De Novo Stricture with Localized SIBO")
+    analyze_and_report(thickness=7.0, structural_floor=1.2, activation_pct=60.0, missing_valve=False, description="De Novo Stricture with Localized SIBO")
 
     # Post-Op Anastomosis
-    analyze_and_report(thickness=4.0, structural_floor=1.5, activation_pct=100.0, description="Post-Op Anastomosis")
+    analyze_and_report(thickness=4.0, structural_floor=1.5, activation_pct=100.0, missing_valve=True, description="Post-Op Anastomosis")
 
 '''
 The "Coverage %" Cheat Sheet
@@ -265,91 +266,91 @@ The "Target Zone" is the Fibrotic Submucosa. This is the engine room where the s
 '''
 ==========================================
 REPORT FOR 5.0mm WALL STRICTURE
-Patient Profile: Floor=1.5x | Activation=100.0%
+Lumen narrowed to: 7.0mm (Area Ratio: 2.04x)
+Calculated Transit Time: 10.2 hours
+Patient Profile: Floor=1.5x | Activation=100.0% | Missing Ileocecal Valve: Yes
 Patient Description: (Base Case) Post-Ileocecal Resection with Dense Scarring
 ==========================================
 THEORETICAL BEST CASE (Structural Baseline)
- - Max potential if acute inflammation is fully resolved.
- - Target Coverage: 90.0%
+ - Target Coverage: 98.3%
  - Verdict:  VERY BULLISH (Interception Likely)
 ----------------------------------------
 PREDICTED TRIAL RESULT (Day 14 Dynamic)
- - Starts with flare (3.0x), heals to baseline (1.5x).
- - Target Coverage: 81.7%
+ - Target Coverage: 90.0%
  - Verdict:  VERY BULLISH (Interception Likely)
 
 ==========================================
 REPORT FOR 7.0mm WALL STRICTURE
-Patient Profile: Floor=1.5x | Activation=100.0%
+Lumen narrowed to: 5.0mm (Area Ratio: 4.00x)
+Calculated Transit: 20.0 hours -> CAPPED at 16.0h (Clinical Obstruction Limit)
+Patient Profile: Floor=1.5x | Activation=100.0% | Missing Ileocecal Valve: Yes
 Patient Description: Post-Ileocecal Resection with Dense Scarring
 ==========================================
 THEORETICAL BEST CASE (Structural Baseline)
- - Max potential if acute inflammation is fully resolved.
- - Target Coverage: 54.5%
- - Verdict:  NEUTRAL (Slowing Progression)
+ - Target Coverage: 67.7%
+ - Verdict:  BULLISH (Effective Treatment)
 ----------------------------------------
 PREDICTED TRIAL RESULT (Day 14 Dynamic)
- - Starts with flare (3.0x), heals to baseline (1.5x).
- - Target Coverage: 49.5%
- - Verdict:  NEUTRAL (Slowing Progression)
+ - Target Coverage: 61.6%
+ - Verdict:  BULLISH (Effective Treatment)
 
 ==========================================
 REPORT FOR 9.0mm WALL STRICTURE
-Patient Profile: Floor=1.5x | Activation=100.0%
+Lumen narrowed to: 3.0mm (Area Ratio: 11.11x)
+Calculated Transit: 55.6 hours -> CAPPED at 16.0h (Clinical Obstruction Limit)
+Patient Profile: Floor=1.5x | Activation=100.0% | Missing Ileocecal Valve: Yes
 Patient Description: Post-Ileocecal Resection with Dense Scarring
 ==========================================
 THEORETICAL BEST CASE (Structural Baseline)
- - Max potential if acute inflammation is fully resolved.
- - Target Coverage: 38.6%
+ - Target Coverage: 46.4%
  - Verdict:  NEUTRAL (Slowing Progression)
 ----------------------------------------
 PREDICTED TRIAL RESULT (Day 14 Dynamic)
- - Starts with flare (3.0x), heals to baseline (1.5x).
- - Target Coverage: 35.0%
+ - Target Coverage: 42.1%
  - Verdict:  NEUTRAL (Slowing Progression)
 
 ==========================================
 REPORT FOR 5.0mm WALL STRICTURE
-Patient Profile: Floor=1.2x | Activation=60.0%
+Lumen narrowed to: 7.0mm (Area Ratio: 2.04x)
+Calculated Transit: 16.3 hours -> CAPPED at 16.0h (Clinical Obstruction Limit)
+Patient Profile: Floor=1.2x | Activation=60.0% | Missing Ileocecal Valve: No
 Patient Description: De Novo Stricture with Localized SIBO
 ==========================================
 THEORETICAL BEST CASE (Structural Baseline)
- - Max potential if acute inflammation is fully resolved.
- - Target Coverage: 81.7%
- - Verdict:  VERY BULLISH (Interception Likely)
-----------------------------------------
-PREDICTED TRIAL RESULT (Day 14 Dynamic)
- - Starts with flare (3.0x), heals to baseline (1.2x).
- - Target Coverage: 71.7%
- - Verdict:  BULLISH (Effective Treatment)
-
-==========================================
-REPORT FOR 7.0mm WALL STRICTURE
-Patient Profile: Floor=1.2x | Activation=60.0%
-Patient Description: De Novo Stricture with Localized SIBO
-==========================================
-THEORETICAL BEST CASE (Structural Baseline)
- - Max potential if acute inflammation is fully resolved.
- - Target Coverage: 50.5%
- - Verdict:  NEUTRAL (Slowing Progression)
-----------------------------------------
-PREDICTED TRIAL RESULT (Day 14 Dynamic)
- - Starts with flare (3.0x), heals to baseline (1.2x).
- - Target Coverage: 43.4%
- - Verdict:  NEUTRAL (Slowing Progression)
-
-==========================================
-REPORT FOR 4.0mm WALL STRICTURE
-Patient Profile: Floor=1.5x | Activation=100.0%
-Patient Description: Post-Op Anastomosis
-==========================================
-THEORETICAL BEST CASE (Structural Baseline)
- - Max potential if acute inflammation is fully resolved.
  - Target Coverage: 100.0%
  - Verdict:  VERY BULLISH (Interception Likely)
 ----------------------------------------
 PREDICTED TRIAL RESULT (Day 14 Dynamic)
- - Starts with flare (3.0x), heals to baseline (1.5x).
+ - Target Coverage: 93.3%
+ - Verdict:  VERY BULLISH (Interception Likely)
+
+==========================================
+REPORT FOR 7.0mm WALL STRICTURE
+Lumen narrowed to: 5.0mm (Area Ratio: 4.00x)
+Calculated Transit: 32.0 hours -> CAPPED at 16.0h (Clinical Obstruction Limit)
+Patient Profile: Floor=1.2x | Activation=60.0% | Missing Ileocecal Valve: No
+Patient Description: De Novo Stricture with Localized SIBO
+==========================================
+THEORETICAL BEST CASE (Structural Baseline)
+ - Target Coverage: 64.6%
+ - Verdict:  BULLISH (Effective Treatment)
+----------------------------------------
+PREDICTED TRIAL RESULT (Day 14 Dynamic)
+ - Target Coverage: 56.6%
+ - Verdict:  NEUTRAL (Slowing Progression)
+
+==========================================
+REPORT FOR 4.0mm WALL STRICTURE
+Lumen narrowed to: 8.0mm (Area Ratio: 1.56x)
+Calculated Transit Time: 7.8 hours
+Patient Profile: Floor=1.5x | Activation=100.0% | Missing Ileocecal Valve: Yes
+Patient Description: Post-Op Anastomosis
+==========================================
+THEORETICAL BEST CASE (Structural Baseline)
+ - Target Coverage: 100.0%
+ - Verdict:  VERY BULLISH (Interception Likely)
+----------------------------------------
+PREDICTED TRIAL RESULT (Day 14 Dynamic)
  - Target Coverage: 100.0%
  - Verdict:  VERY BULLISH (Interception Likely)
 '''
